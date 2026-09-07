@@ -1,0 +1,214 @@
+diff --git a/codegen/mod.rs b/codegen/mod.rs
+index 47e2ca708..ee9540fa4 100644
+--- a/codegen/mod.rs
++++ b/codegen/mod.rs
+@@ -1848,6 +1848,12 @@ impl FieldCodegen<'_> for BitfieldUnit {
+
+         let access_spec = access_specifier(unit_visibility);
+
++        if let Some(padding_field) =
++            struct_layout.saw_bitfield_unit(layout, self.offset())
++        {
++            fields.extend(Some(padding_field));
++        }
++
+         let field = quote! {
+             #access_spec #unit_field_ident : #field_ty ,
+         };
+@@ -1863,8 +1869,6 @@ impl FieldCodegen<'_> for BitfieldUnit {
+                 }
+             }));
+         }
+-
+-        struct_layout.saw_bitfield_unit(layout);
+     }
+ }
+
+diff --git a/codegen/struct_layout.rs b/codegen/struct_layout.rs
+index ba3243683..c924bd7c8 100644
+--- a/codegen/struct_layout.rs
++++ b/codegen/struct_layout.rs
+@@ -114,24 +114,20 @@ impl<'a> StructLayoutTracker<'a> {
+         }
+     }
+
+-    pub(crate) fn saw_bitfield_unit(&mut self, layout: Layout) {
+-        debug!("saw bitfield unit for {}: {layout:?}", self.name);
+-
+-        self.latest_offset += layout.size;
+-
++    /// Returns a padding field if necessary for a given bitfield unit _before_ adding that unit.
++    pub(crate) fn saw_bitfield_unit(
++        &mut self,
++        layout: Layout,
++        offset: Option<usize>,
++    ) -> Option<proc_macro2::TokenStream> {
+         debug!(
+-            "Offset: <bitfield>: {} -> {}",
+-            self.latest_offset - layout.size,
+-            self.latest_offset
++            "saw bitfield unit for {}: {layout:?} at {offset:?}",
++            self.name
+         );
+-
+-        self.latest_field_layout = Some(layout);
+-        self.last_field_was_bitfield = true;
+-        self.max_field_align = cmp::max(self.max_field_align, layout.align);
++        self.pad_to_offset(layout, offset, /* is_bitfield = */ true)
+     }
+
+-    /// Returns a padding field if necessary for a given new field _before_
+-    /// adding that field.
++    /// Returns a padding field if necessary for a given new field _before_ adding that field.
+     pub(crate) fn saw_field(
+         &mut self,
+         field_name: &str,
+@@ -167,9 +163,23 @@ impl<'a> StructLayoutTracker<'a> {
+         field_name: &str,
+         field_layout: Layout,
+         field_offset: Option<usize>,
++    ) -> Option<proc_macro2::TokenStream> {
++        debug!("saw_field_with_layout({field_name}, offset = {field_offset:?}, layout = {field_layout:?}");
++        self.pad_to_offset(
++            field_layout,
++            field_offset,
++            /* is_bitfield = */ false,
++        )
++    }
++
++    fn pad_to_offset(
++        &mut self,
++        field_layout: Layout,
++        field_offset: Option<usize>,
++        is_bitfield: bool,
+     ) -> Option<proc_macro2::TokenStream> {
+         let will_merge_with_bitfield =
+-            self.will_merge_with_bitfield(field_layout);
++            !is_bitfield && self.will_merge_with_bitfield(field_layout);
+
+         let is_union = self.comp.is_union();
+         let padding_bytes = match field_offset {
+@@ -197,7 +207,9 @@ impl<'a> StructLayoutTracker<'a> {
+
+         self.latest_offset += padding_bytes;
+
+-        let padding_layout = if self.is_packed || is_union {
++        // Bitfield units are always byte-aligned, so packed(N) can't move them into place like it
++        // does for regular fields.
++        let padding_layout = if (self.is_packed && !is_bitfield) || is_union {
+             None
+         } else {
+             let force_padding = self.ctx.options().force_explicit_padding;
+@@ -214,7 +226,7 @@ impl<'a> StructLayoutTracker<'a> {
+             );
+
+             debug!(
+-                "align field {field_name} to {}/{} with {padding_bytes} padding bytes {field_layout:?}",
++                "align field to {}/{} with {padding_bytes} padding bytes {field_layout:?}",
+                 self.latest_offset,
+                 field_offset.unwrap_or(0) / 8,
+             );
+@@ -241,10 +253,10 @@ impl<'a> StructLayoutTracker<'a> {
+         self.latest_field_layout = Some(field_layout);
+         self.max_field_align =
+             cmp::max(self.max_field_align, field_layout.align);
+-        self.last_field_was_bitfield = false;
++        self.last_field_was_bitfield = is_bitfield;
+
+         debug!(
+-            "Offset: {field_name}: {} -> {}",
++            "Offset: {} -> {}",
+             self.latest_offset - field_layout.size,
+             self.latest_offset
+         );
+diff --git a/ir/comp.rs b/ir/comp.rs
+index 7b4efaa34..3349e3815 100644
+--- a/ir/comp.rs
++++ b/ir/comp.rs
+@@ -165,6 +165,8 @@ pub(crate) trait FieldMethods {
+ pub(crate) struct BitfieldUnit {
+     nth: usize,
+     layout: Layout,
++    /// The offset of this unit within the struct, in bits, if known.
++    offset: Option<usize>,
+     bitfields: Vec<Bitfield>,
+ }
+
+@@ -181,6 +183,11 @@ impl BitfieldUnit {
+         self.layout
+     }
+
++    /// Get the offset of this unit within the struct, in bits, if known.
++    pub(crate) fn offset(&self) -> Option<usize> {
++        self.offset
++    }
++
+     /// Get the bitfields within this unit.
+     pub(crate) fn bitfields(&self) -> &[Bitfield] {
+         &self.bitfields
+@@ -560,6 +567,7 @@ where
+         fields: &mut E,
+         bitfield_unit_count: &mut usize,
+         unit_size_in_bits: usize,
++        offset: Option<usize>,
+         bitfields: Vec<Bitfield>,
+     ) where
+         E: Extend<Field>,
+@@ -571,13 +579,14 @@ where
+         fields.extend(Some(Field::Bitfields(BitfieldUnit {
+             nth: *bitfield_unit_count,
+             layout,
++            offset,
+             bitfields,
+         })));
+     }
+
+     // The offset we're in inside the struct, if we know it (we might not know it in presence of
+     // templates).
+-    let mut start_offset_in_struct = 0;
++    let mut known_start_offset = None;
+     let mut max_align = 0;
+     let mut unit_size_in_bits = 0;
+     let mut bitfields_in_unit = vec![];
+@@ -591,7 +600,7 @@ where
+         let bitfield_size = bitfield_layout.size;
+
+         if unit_size_in_bits == 0 {
+-            start_offset_in_struct = bitfield.offset().unwrap_or(0);
++            known_start_offset = bitfield.offset();
+         }
+
+         let mut offset_in_struct =
+@@ -599,6 +608,7 @@ where
+
+         // A zero-width field serves as alignment / padding.
+         if !packed &&
++            bitfield.offset().is_none() &&
+             offset_in_struct != 0 &&
+             (bitfield_width == 0 ||
+                 (offset_in_struct & (bitfield_align * 8 - 1)) +
+@@ -621,12 +631,10 @@ where
+         // bitfields over their types size cause weird allocation size behavior from clang.
+         // Therefore, all bitfields needed to be kept around in order to check for this
+         // and make the struct opaque in this case
+-        bitfields_in_unit.push(Bitfield::new(
+-            offset_in_struct - start_offset_in_struct,
+-            bitfield,
+-        ));
+-        unit_size_in_bits =
+-            offset_in_struct - start_offset_in_struct + bitfield_width;
++        let bitfield_offset =
++            offset_in_struct - known_start_offset.unwrap_or(0);
++        bitfields_in_unit.push(Bitfield::new(bitfield_offset, bitfield));
++        unit_size_in_bits = bitfield_offset + bitfield_width;
+     }
+
+     if unit_size_in_bits != 0 {
+@@ -635,6 +643,7 @@ where
+             fields,
+             bitfield_unit_count,
+             unit_size_in_bits,
++            known_start_offset,
+             bitfields_in_unit,
+         );
+     }
