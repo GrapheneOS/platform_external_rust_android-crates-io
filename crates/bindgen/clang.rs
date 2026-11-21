@@ -500,6 +500,63 @@ impl Cursor {
         }
     }
 
+    /// Find the source declaration for an implicit anonymous record field.
+    /// A named field with the same type has its own source location.
+    pub(crate) fn anonymous_field_index(
+        &self,
+        records: &[Cursor],
+    ) -> Option<usize> {
+        let decl = self.cur_type().declaration();
+        let same_location = unsafe {
+            clang_equalLocations(
+                clang_getCursorLocation(self.x),
+                clang_getCursorLocation(decl.x),
+            )
+        };
+        if same_location == 0 {
+            return None;
+        }
+        records.iter().position(|record| *record == decl)
+    }
+
+    /// Collect the actual fields of a C record, including the implicit field
+    /// for each anonymous struct or union, in Clang's layout order.
+    pub(crate) fn c_record_fields(&self) -> Option<(Vec<Cursor>, Vec<Cursor>)> {
+        if !matches!(self.kind(), CXCursor_StructDecl | CXCursor_UnionDecl)
+            || unsafe { clang_getCursorLanguage(self.x) } != CXLanguage_C
+        {
+            return None;
+        }
+
+        let mut anonymous = Vec::new();
+        self.visit(|cur| {
+            if matches!(cur.kind(), CXCursor_StructDecl | CXCursor_UnionDecl)
+                && unsafe { clang_Cursor_isAnonymousRecordDecl(cur.x) != 0 }
+            {
+                anonymous.push(cur);
+            }
+            CXChildVisit_Continue
+        });
+        extern "C" fn collect(
+            cur: CXCursor,
+            data: CXClientData,
+        ) -> CXVisitorResult {
+            let fields = unsafe { &mut *data.cast::<Vec<Cursor>>() };
+            fields.push(Cursor { x: cur });
+            CXVisit_Continue
+        }
+
+        let mut fields = Vec::new();
+        unsafe {
+            clang_Type_visitFields(
+                self.cur_type().x,
+                collect,
+                ptr::addr_of_mut!(fields).cast(),
+            );
+        }
+        Some((fields, anonymous))
+    }
+
     /// Traverse all of this cursor's children, sorted by where they appear in source code.
     ///
     /// Call the given function on each AST node traversed.

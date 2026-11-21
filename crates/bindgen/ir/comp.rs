@@ -1291,7 +1291,17 @@ impl CompInfo {
             });
 
         let mut maybe_anonymous_struct_field = None;
-        cursor.visit(|cur| {
+        // Under Clang layout randomization, nested type declarations can
+        // become separated from their fields in the list of AST children.
+        let c_fields = if ctx.options().clang_args.iter().any(|arg| {
+            arg.starts_with("-frandomize-layout-seed=") ||
+                arg.starts_with("-frandomize-layout-seed-file=")
+        }) {
+            cursor.c_record_fields()
+        } else {
+            None
+        };
+        let mut parse_member = |cur: clang::Cursor| {
             if cur.kind() != CXCursor_FieldDecl {
                 if let Some((ty, clang_ty, public, offset)) =
                     maybe_anonymous_struct_field.take()
@@ -1358,7 +1368,16 @@ impl CompInfo {
 
                     let comment = cur.raw_comment();
                     let annotations = Annotations::new(&cur);
-                    let name = cur.spelling();
+                    // Keep anonymous field identifiers stable across seeds.
+                    let index = c_fields.as_ref().and_then(|(_, records)| {
+                        cur.anonymous_field_index(records)
+                    });
+                    let name = match index {
+                        Some(i) => {
+                            format!("{}{}", ctx.options().anon_fields_prefix, i + 1)
+                        }
+                        None => cur.spelling(),
+                    };
                     let is_public = cur.public_accessible();
                     let offset = cur.offset_of_field().ok();
 
@@ -1434,7 +1453,9 @@ impl CompInfo {
 
                         // A declaration of an union or a struct without name
                         // could also be an unnamed field, unfortunately.
-                        if cur.is_anonymous() && cur.kind() != CXCursor_EnumDecl
+                        if c_fields.is_none() &&
+                            cur.is_anonymous() &&
+                            cur.kind() != CXCursor_EnumDecl
                         {
                             let ty = cur.cur_type();
                             let public = cur.public_accessible();
@@ -1589,7 +1610,21 @@ impl CompInfo {
                 }
             }
             CXChildVisit_Continue
+        };
+        cursor.visit(|cur| {
+            if c_fields.is_some() && cur.kind() == CXCursor_FieldDecl {
+                CXChildVisit_Continue
+            } else {
+                parse_member(cur)
+            }
         });
+        if let Some((fields, _)) = &c_fields {
+            for &field in fields {
+                if parse_member(field) == CXChildVisit_Break {
+                    break;
+                }
+            }
+        }
 
         if let Some((ty, _, public, offset)) = maybe_anonymous_struct_field {
             let field =
